@@ -297,7 +297,7 @@ describe('the Grok sign-in of the mobile app', () => {
         providerEndpoints({ 'https://auth.x.ai/oauth2/device/code': grokStarted })
         const { POST } = await import('@/app/api/v1/ai-connections/grok/start/route')
         const start = await expectContract(mobileApi.startGrokSignIn, await callRoute(POST, mobileApi.startGrokSignIn))
-        expect(start).toMatchObject({ ticket: expect.any(String), userCode: 'N4FS-5STQ', verificationUrl: 'https://accounts.x.ai/oauth2/device?user_code=N4FS-5STQ', pollIntervalMs: 5000 })
+        expect(start).toMatchObject({ ticket: expect.any(String), userCode: 'N4FS-5STQ', verificationUrl: 'https://accounts.x.ai/oauth2/device?user_code=N4FS-5STQ', pollIntervalMs: 6000 })
         expect(JSON.stringify(start)).not.toContain(grokDeviceCode)
         const sent = new URLSearchParams(String(vi.mocked(fetch).mock.calls[0]![1]!.body))
         expect(Object.fromEntries(sent)).toEqual({ client_id: 'b1a00492-073a-47ea-816f-4c329264a828', scope: 'openid profile email offline_access grok-cli:access api:access' })
@@ -306,7 +306,7 @@ describe('the Grok sign-in of the mobile app', () => {
     it('shows no address xAI answers with off its own sign-in page', async () => {
         providerEndpoints({ 'https://auth.x.ai/oauth2/device/code': () => Response.json({ device_code: grokDeviceCode, user_code: 'N4FS-5STQ', verification_uri_complete: 'https://evil.example/approve', expires_in: 1800, interval: 1 }) })
         const { POST } = await import('@/app/api/v1/ai-connections/grok/start/route')
-        expect(await expectContract(mobileApi.startGrokSignIn, await callRoute(POST, mobileApi.startGrokSignIn))).toMatchObject({ verificationUrl: 'https://accounts.x.ai/oauth2/device', pollIntervalMs: 5000 })
+        expect(await expectContract(mobileApi.startGrokSignIn, await callRoute(POST, mobileApi.startGrokSignIn))).toMatchObject({ verificationUrl: 'https://accounts.x.ai/oauth2/device', pollIntervalMs: 6000 })
     })
 
     it('says the machine has to update first when its engine does not run Grok', async () => {
@@ -321,9 +321,9 @@ describe('the Grok sign-in of the mobile app', () => {
     it('answers pending until xAI approves, then stores the Grok tokens and hands none of them back', async () => {
         const { POST } = await import('@/app/api/v1/ai-connections/grok/poll/route')
         const ticket = mintGrokSignIn('user-ada', 7, { deviceCode: grokDeviceCode, expiresAt: Date.now() + 1_800_000 })
-        for (const error of ['authorization_pending', 'slow_down']) {
+        for (const [error, answer] of [['authorization_pending', { status: 'pending' }], ['slow_down', { status: 'pending', slowDown: true }]] as const) {
             providerEndpoints(grokPoll(() => Response.json({ error }, { status: 400 })))
-            expect(await expectContract(mobileApi.pollGrokSignIn, await callRoute(POST, mobileApi.pollGrokSignIn, { body: { ticket } }))).toEqual({ status: 'pending' })
+            expect(await expectContract(mobileApi.pollGrokSignIn, await callRoute(POST, mobileApi.pollGrokSignIn, { body: { ticket } }))).toEqual(answer)
         }
 
         providerEndpoints(grokPoll(grokApproved))
@@ -388,6 +388,71 @@ describe('the Grok sign-in of the mobile app', () => {
         expect(await expectContract(mobileApi.pollGrokSignIn, res, 400)).toMatchObject({ code: 'grokSignInNotStored' })
         const revoked = vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/oauth2/revoke')).map(([, init]) => new URLSearchParams(String(init!.body)).get('token'))
         expect(revoked).toEqual(['grok-refresh', 'grok-access'])
+    })
+
+    const grokTicket = () => mintGrokSignIn('user-ada', 7, { deviceCode: grokDeviceCode, expiresAt: Date.now() + 1_800_000 })
+    const revokedTokens = () => vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/oauth2/revoke'))
+    const machineHolding = (...connections: BoxConnection[]) => ({ connections: [rerun, ...connections], default: null, backups: { backups: [], rerunCreditLastResort: false } })
+    const grokOnMachine = (fields: Partial<BoxConnection> = {}) => boxConnection({ id: 'cnx-grok', name: 'Grok', provider: 'grok', models: ['grok-4.6'], ...fields })
+
+    it('keeps a sign-in the machine stored although its answer never came back, and revokes nothing', async () => {
+        let stored = false
+        engine.listConnections.mockImplementation(async () => (stored ? machineHolding(grokOnMachine()) : machineHolding()))
+        engine.createConnection.mockImplementation(async () => {
+            stored = true
+            throw new Error('The operation was aborted due to timeout')
+        })
+        providerEndpoints(grokPoll(grokApproved))
+        const { POST } = await import('@/app/api/v1/ai-connections/grok/poll/route')
+        const res = await callRoute(POST, mobileApi.pollGrokSignIn, { body: { ticket: grokTicket() } })
+        expect(await expectContract(mobileApi.pollGrokSignIn, res)).toEqual({ status: 'connected', connectionId: 'cnx-grok' })
+        expect(revokedTokens()).toHaveLength(0)
+    })
+
+    it('hands back a sign-in the machine refused outright, without asking it what it holds', async () => {
+        const { EngineRequestError } = await import('@/lib/engine/client')
+        engine.listConnections.mockResolvedValue(machineHolding())
+        engine.createConnection.mockRejectedValue(new EngineRequestError('rerun-engine POST /connections failed: 400 {"error":"bad keys"}', 400))
+        providerEndpoints({ ...grokPoll(grokApproved), 'https://auth.x.ai/oauth2/revoke': () => new Response(null, { status: 200 }) })
+        const { POST } = await import('@/app/api/v1/ai-connections/grok/poll/route')
+        const res = await callRoute(POST, mobileApi.pollGrokSignIn, { body: { ticket: grokTicket() } })
+        expect(await expectContract(mobileApi.pollGrokSignIn, res, 400)).toMatchObject({ code: 'grokSignInNotStored' })
+        expect(revokedTokens()).toHaveLength(2)
+        expect(engine.listConnections).toHaveBeenCalledTimes(2)
+    })
+
+    it('revokes nothing while it cannot tell what the machine holds', async () => {
+        let failed = false
+        engine.listConnections.mockImplementation(async () => {
+            if (failed) throw new Error('engine unreachable')
+            return machineHolding()
+        })
+        engine.createConnection.mockImplementation(async () => {
+            failed = true
+            throw new Error('engine unreachable')
+        })
+        providerEndpoints(grokPoll(grokApproved))
+        const { POST } = await import('@/app/api/v1/ai-connections/grok/poll/route')
+        const res = await callRoute(POST, mobileApi.pollGrokSignIn, { body: { ticket: grokTicket() } })
+        expect(await expectContract(mobileApi.pollGrokSignIn, res, 400)).toMatchObject({ code: 'grokSignInNotStored' })
+        expect(revokedTokens()).toHaveLength(0)
+    })
+
+    it.each([
+        ['back on its feet', false, { status: 'connected', connectionId: 'cnx-grok' }, undefined],
+        ['still turned away', true, { code: 'grokSignInNotStored' }, 400],
+    ] as const)('never revokes the keys sent to a connection signed in again, whether it reads %s or not', async (_name, stillRejected, answer, status) => {
+        let sent = false
+        engine.listConnections.mockImplementation(async () => machineHolding(grokOnMachine({ credentialRejected: !sent || stillRejected })))
+        engine.updateConnectionKeys.mockImplementation(async () => {
+            sent = true
+            throw new Error('The operation was aborted due to timeout')
+        })
+        providerEndpoints(grokPoll(grokApproved))
+        const { POST } = await import('@/app/api/v1/ai-connections/grok/poll/route')
+        const res = await callRoute(POST, mobileApi.pollGrokSignIn, { body: { ticket: grokTicket(), connectionId: 'cnx-grok' } })
+        expect(await expectContract(mobileApi.pollGrokSignIn, res, status)).toMatchObject(answer)
+        expect(revokedTokens()).toHaveLength(0)
     })
 
     it('drops what an earlier Grok sign-in left that the new one does not carry', async () => {

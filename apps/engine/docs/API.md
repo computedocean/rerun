@@ -465,9 +465,9 @@ hands the tokens over once (`GROK_OAUTH_TOKEN`, `GROK_OAUTH_REFRESH_TOKEN`, `GRO
 them against `https://auth.x.ai/oauth2/token`: two minutes before the access token lapses, under the
 connection's lock, from the lineage on disk, one refresh at a time per connection (xAI rotates the
 refresh token on every use). A refused grant marks the connection `credentialRejected`; a network
-failure, a 429 or a 5xx keeps the token in hand while it lasts. `DELETE /connections/:id` revokes
-both tokens at `https://auth.x.ai/oauth2/revoke` first, under the same lock as a refresh, best
-effort.
+failure, a 429 or a 5xx keeps the token in hand while it lasts. `DELETE /connections/:id` reads the
+tokens under the same lock as a refresh, removes the connection, then revokes both at
+`https://auth.x.ai/oauth2/revoke`, best effort and without holding its answer for it.
 
 There is no CLI: the engine runs Grok in its own loop, on the OpenAI SDK's Responses model, against
 Grok Build's proxy `https://cli-chat-proxy.grok.com/v1`, with `store: false` and the encrypted
@@ -483,11 +483,11 @@ the proxy asks for.
   week is spent, no reading when the answer has another shape.
 - The context window is the 256k the subscription serves.
 - A refusal is rewritten into a sentence the chat knows, never with xAI's body (it names the
-  account's team): the week spent → "Grok weekly limit reached · resets …", an account without the
-  plan → "No Grok subscription on this xAI account" (both send the run to the backups, neither
-  locks a model), a refusal of the allowance the week's reading cannot explain → "Grok usage limit
-  reached", a model not served → "Grok plan does not
-  include" and its id, a `401` after the refresh → "Grok sign-in refused (401)".
+  account's team): the week spent → "Grok weekly limit reached · resets …", an account xAI says has
+  no Grok Build (`hasGrokCodeAccess: false` of `GET /v1/user`) → "No Grok subscription on this xAI account" (both
+  send the run to the backups, neither locks a model), a refusal of the allowance neither explains →
+  "Grok usage limit reached", a model not served → "Grok plan does not include" and its id, a `401`
+  after the refresh → "Grok sign-in refused (401)".
 - Grok 4.5 does not see images: `vision_analyze` asks the first model of the connection that does,
   and the computer tools are not offered on it.
 
